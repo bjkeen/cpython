@@ -37,6 +37,25 @@ struct arraydescr {
     int is_signed;
 };
 
+const struct arraydescr *
+lookup_descr(const struct arraydescr* descrs, const char sought_typecode)
+{
+    const struct arraydescr* rv = NULL;
+
+    for(rv=descrs; rv->typecode != '\0'; ++rv)
+    {
+        if (rv->typecode == sought_typecode ) {
+            break;
+        }
+    }
+
+    if (rv->typecode == '\0') {
+        return NULL;
+    } else {
+        return rv;
+    }
+}
+
 typedef struct arrayobject {
     PyObject_VAR_HEAD
     char *ob_item;
@@ -44,6 +63,7 @@ typedef struct arrayobject {
     const struct arraydescr *ob_descr;
     PyObject *weakreflist; /* List of weak references */
     Py_ssize_t ob_exports;  /* Number of exported buffers */
+    Py_buffer *view; /* non-NULL if constructed from memoryview */
 } arrayobject;
 
 static PyTypeObject Arraytype;
@@ -117,6 +137,12 @@ array_resize(arrayobject *self, Py_ssize_t newsize)
     if (self->ob_exports > 0 && newsize != Py_SIZE(self)) {
         PyErr_SetString(PyExc_BufferError,
             "cannot resize an array that is exporting buffers");
+        return -1;
+    }
+
+    if (self->view != NULL && newsize != Py_SIZE(self)) {
+        PyErr_SetString(PyExc_BufferError,
+                "cannot resize an array constructed from an imported buffer");
         return -1;
     }
 
@@ -544,6 +570,9 @@ DEFINE_COMPAREITEMS(QQ, unsigned long long)
  *
  * Don't forget to update typecode_to_mformat_code() if you add a new
  * typecode.
+ *
+ * Note impl depends on all .itemsize being a power of 2 where memoryview
+ * initialization checks pointer alignment
  */
 static const struct arraydescr descriptors[] = {
     {'b', 1, b_getitem, b_setitem, b_compareitems, "b", 1, 1},
@@ -559,7 +588,7 @@ static const struct arraydescr descriptors[] = {
     {'Q', sizeof(long long), QQ_getitem, QQ_setitem, QQ_compareitems, "Q", 1, 0},
     {'f', sizeof(float), f_getitem, f_setitem, NULL, "f", 0, 0},
     {'d', sizeof(double), d_getitem, d_setitem, NULL, "d", 0, 0},
-    {'\0', 0, 0, 0, 0, 0, 0} /* Sentinel */
+    {'\0', 0, 0, 0, 0, 0, 0, 0} /* Sentinel */
 };
 
 /****************************************************************************
@@ -605,6 +634,24 @@ newarrayobject(PyTypeObject *type, Py_ssize_t size, const struct arraydescr *des
         }
     }
     op->ob_exports = 0;
+    op->view = NULL;
+    return (PyObject *) op;
+}
+
+
+static PyObject *
+wrap_to_array(PyTypeObject *type, Py_buffer *view,
+              const struct arraydescr *descr)
+{
+    arrayobject *op = (arrayobject *) type->tp_alloc(type, 0);
+    if (op != NULL) {
+        op->ob_item = view->buf;
+        op->ob_descr = descr;
+        Py_SIZE(op) = (op->allocated = view->len / descr->itemsize);
+        op->weakreflist = NULL;
+        op->view = view;
+        op->ob_exports = 0;
+    }
     return (PyObject *) op;
 }
 
@@ -655,8 +702,14 @@ array_dealloc(arrayobject *op)
 {
     if (op->weakreflist != NULL)
         PyObject_ClearWeakRefs((PyObject *) op);
-    if (op->ob_item != NULL)
-        PyMem_DEL(op->ob_item);
+
+    if (op->view == NULL) {
+        if (op->ob_item != NULL)
+            PyMem_DEL(op->ob_item);
+    } else {
+        PyBuffer_Release(op->view);
+        PyMem_Free(op->view);
+    }
     Py_TYPE(op)->tp_free((PyObject *)op);
 }
 
@@ -836,7 +889,7 @@ Return a copy of the array.
 [clinic start generated code]*/
 
 static PyObject *
-array_array___deepcopy__(arrayobject *self, PyObject *unused)
+array_array___deepcopy__(arrayobject *self, PyObject * Py_UNUSED(unused))
 /*[clinic end generated code: output=1ec748d8e14a9faa input=2405ecb4933748c4]*/
 {
     return array_array___copy___impl(self);
@@ -936,6 +989,13 @@ array_del_slice(arrayobject *a, Py_ssize_t ilow, Py_ssize_t ihigh)
             "cannot resize an array that is exporting buffers");
         return -1;
     }
+
+    if (d != 0 && a->view != NULL) {
+        PyErr_SetString(PyExc_BufferError,
+                        "cannot resize an array constructed from an imported buffer");
+        return -1;
+    }
+
     if (d > 0) { /* Delete d items */
         memmove(item + (ihigh-d)*a->ob_descr->itemsize,
             item + ihigh*a->ob_descr->itemsize,
@@ -1925,7 +1985,8 @@ Internal. Used for pickling support.
 [clinic start generated code]*/
 
 static PyObject *
-array__array_reconstructor_impl(PyObject *module, PyTypeObject *arraytype,
+array__array_reconstructor_impl(PyObject * Py_UNUSED(module),
+                                PyTypeObject *arraytype,
                                 int typecode,
                                 enum machine_format_code mformat_code,
                                 PyObject *items)
@@ -2214,14 +2275,14 @@ array_array___reduce_ex__(arrayobject *self, PyObject *value)
 }
 
 static PyObject *
-array_get_typecode(arrayobject *a, void *closure)
+array_get_typecode(arrayobject *a, void * Py_UNUSED(closure))
 {
     char typecode = a->ob_descr->typecode;
     return PyUnicode_FromOrdinal(typecode);
 }
 
 static PyObject *
-array_get_itemsize(arrayobject *a, void *closure)
+array_get_itemsize(arrayobject *a, void * Py_UNUSED(closure))
 {
     return PyLong_FromLong((long)a->ob_descr->itemsize);
 }
@@ -2426,10 +2487,17 @@ array_ass_subscr(arrayobject* self, PyObject* item, PyObject* value)
     /* Issue #4509: If the array has exported buffers and the slice
        assignment would change the size of the array, fail early to make
        sure we don't modify it. */
-    if ((needed == 0 || slicelength != needed) && self->ob_exports > 0) {
-        PyErr_SetString(PyExc_BufferError,
-            "cannot resize an array that is exporting buffers");
-        return -1;
+    if (needed == 0 || slicelength != needed) {
+        if (self->ob_exports > 0) {
+            PyErr_SetString(PyExc_BufferError,
+                            "cannot resize an array that is exporting buffers");
+            return -1;
+        }
+        if (self->view != NULL) {
+            PyErr_SetString(PyExc_BufferError,
+                            "cannot resize an array constructed from an imported buffer");
+            return -1;
+        }
     }
 
     if (step == 1) {
@@ -2556,7 +2624,7 @@ array_buffer_getbuf(arrayobject *self, Py_buffer *view, int flags)
 }
 
 static void
-array_buffer_relbuf(arrayobject *self, Py_buffer *view)
+array_buffer_relbuf(arrayobject *self, Py_buffer * Py_UNUSED(view))
 {
     self->ob_exports--;
 }
@@ -2578,6 +2646,52 @@ static PyBufferProcs array_as_buffer = {
     (getbufferproc)array_buffer_getbuf,
     (releasebufferproc)array_buffer_relbuf
 };
+
+/* Tries to set up parms for buffer protocol.
+ * On success, returns a new Py_buffer in *view allocated using PyMem
+ * On failure returns NULL
+ */
+Py_buffer *
+get_compatible_view(int typecode, PyObject *initial,
+                    const struct arraydescr **wrap_descr)
+{
+    const struct arraydescr *found_descr = lookup_descr(descriptors,
+                                                        typecode);
+
+    if (NULL == found_descr) {
+        PyErr_SetString(PyExc_ValueError,
+                        "bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)");
+        return NULL;
+    }
+
+    Py_buffer *view = PyMem_Malloc(sizeof(Py_buffer));
+    int gb_result = PyObject_GetBuffer(initial, view, PyBUF_CONTIG);
+
+    int badness = 0;
+    if (-1 == gb_result) {
+        badness = 1;
+    } else if (0 != view->len) { /* on non-empty array, check len, base vs element size */
+        unsigned long long align_mask = (found_descr->itemsize - 1);
+
+        if (((unsigned long long)(view->buf) & align_mask) != 0) {
+            PyErr_SetString(PyExc_ValueError,
+                            "buffer base pointer must be aligned to element size" );
+            badness = 1;
+        } else if ((view->len & align_mask) != 0) {
+            PyErr_SetString(PyExc_ValueError,
+                            "element size must evenly divide buffer size" );
+            badness = 1;
+        }
+    }
+
+    if (badness) {
+        PyBuffer_Release(view);
+        return NULL;
+    } else {
+        *wrap_descr = found_descr;
+        return view;
+    }
+}
 
 static PyObject *
 array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
@@ -2609,6 +2723,35 @@ array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
                          "initialize an array with typecode '%c'", c);
             return NULL;
         }
+    }
+
+    /* Construct from a Memoryview.
+     *
+     * The reason NOT to use PyObject_CheckBuffer, and
+     * insist on a MemoryView is because initialization
+     * from bytes like objects and array slices is
+     * is expected to copy, and these can export buffers.
+     *
+     * If a user wants to construct an object from
+     * an exported buffer from an object x, such as bytes
+     * when a zero-copy reference is wanted, they may
+     * do this explicitly via
+     * y = array(memoryview(x))
+     * */
+    if ( (initial != NULL) && PyMemoryView_Check(initial)) {
+        const struct arraydescr *the_descr;
+        Py_buffer *view = get_compatible_view(c, initial, &the_descr);
+
+        if (NULL == view) {
+            return NULL;
+        }
+
+        PyObject *rv = wrap_to_array(type, view, the_descr);
+        if (NULL == rv) {
+            PyBuffer_Release(view);
+            PyMem_Free(view);
+        }
+        return rv;
     }
 
     if (!(initial == NULL || PyList_Check(initial)
@@ -2721,7 +2864,6 @@ array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         "bad typecode (must be b, B, u, h, H, i, I, l, L, q, Q, f or d)");
     return NULL;
 }
-
 
 PyDoc_STRVAR(module_doc,
 "This module defines an object type which can efficiently represent\n\
