@@ -1227,6 +1227,23 @@ class UnicodeTest(StringTest, unittest.TestCase):
 
 class NumberTest(BaseTest):
 
+    def test_mview_init(self):
+        a = array.array(self.typecode, self.example)
+        a_mv = array.array(self.typecode, memoryview(a))
+
+        def different(x):
+            return int(not bool(x))
+
+        a[0] = different(a[0])
+        self.assertEqual(a[0], a_mv[0])
+
+        a_mv[-1] = different(a[-1])
+        self.assertEqual(a[-1], a_mv[-1])
+
+        a_shift_mv = array.array(self.typecode, memoryview(a)[1:])
+        a_shift_mv[2] = different(a_shift_mv[2])
+        self.assertEqual(a_shift_mv[2], a[3])
+
     def test_extslice(self):
         a = array.array(self.typecode, range(5))
         a_mv = array.array(self.typecode, memoryview(a))
