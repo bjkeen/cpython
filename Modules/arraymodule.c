@@ -2818,7 +2818,7 @@ array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
                 return NULL;
             }
             self->ob_item = item;
-            Py_SET_SIZE(self, (n / sizeof(Py_UNICODE));
+            Py_SET_SIZE(self, n / sizeof(Py_UNICODE));
             memcpy(item, ustr, n);
             self->allocated = Py_SIZE(self);
         }
