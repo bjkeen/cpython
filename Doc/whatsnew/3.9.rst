@@ -70,6 +70,12 @@ Summary -- Release highlights
 New Features
 ============
 
+Dictionary Merge & Update Operators
+-----------------------------------
+
+Merge (``|``) and update (``|=``) operators have been added to the built-in
+:class:`dict` class.  See :pep:`584` for a full description.
+(Contributed by Brandt Bucher in :issue:`36144`.)
 
 
 Other Language Changes
@@ -213,8 +219,25 @@ now raises :exc:`ImportError` instead of :exc:`ValueError` for invalid relative
 import attempts.
 (Contributed by Ngalim Siregar in :issue:`37444`.)
 
+ipaddress
+---------
+
+:mod:`ipaddress` now supports IPv6 Scoped Addresses (IPv6 address with suffix ``%<scope_id>``).
+
+Scoped IPv6 addresses can be parsed using :class:`ipaddress.IPv6Address`.
+If present, scope zone ID is available through the :attr:`~ipaddress.IPv6Address.scope_id` attribute.
+(Contributed by Oleksandr Pavliuk in :issue:`34788`.)
+
 math
 ----
+
+Expanded the :func:`math.gcd` function to handle multiple arguments.
+Formerly, it only supported two arguments.
+(Contributed by Serhiy Storchaka in :issue:`39648`.)
+
+Add :func:`math.lcm`: return the least common multiple of specified arguments.
+(Contributed by Mark Dickinson, Ananthakrishnan and Serhiy Storchaka in
+:issue:`39479` and :issue:`39648`.)
 
 Add :func:`math.nextafter`: return the next floating-point value after *x*
 towards *y*.
@@ -584,9 +607,6 @@ Changes in the Python API
   since the *buffering* parameter has been removed.
   (Contributed by Victor Stinner in :issue:`39357`.)
 
-* The :mod:`importlib` module now ignores the :envvar:`PYTHONCASEOK`
-  environment variable when the :option:`-E` or :option:`-I` command line
-  options are being used.
 
 CPython bytecode changes
 ------------------------
