@@ -26,7 +26,7 @@ import operator
 import re as stdlib_re  # Avoid confusion with the re we export.
 import sys
 import types
-from types import WrapperDescriptorType, MethodWrapperType, MethodDescriptorType
+from types import WrapperDescriptorType, MethodWrapperType, MethodDescriptorType, GenericAlias
 
 # Please keep __all__ alphabetized within each category.
 __all__ = [
@@ -180,7 +180,8 @@ def _collect_type_vars(types):
     for t in types:
         if isinstance(t, TypeVar) and t not in tvars:
             tvars.append(t)
-        if isinstance(t, _GenericAlias) and not t._special:
+        if ((isinstance(t, _GenericAlias) and not t._special)
+                or isinstance(t, GenericAlias)):
             tvars.extend([t for t in t.__parameters__ if t not in tvars])
     return tuple(tvars)
 
@@ -947,7 +948,7 @@ _TYPING_INTERNALS = ['__parameters__', '__orig_bases__',  '__orig_class__',
 
 _SPECIAL_NAMES = ['__abstractmethods__', '__annotations__', '__dict__', '__doc__',
                   '__init__', '__module__', '__new__', '__slots__',
-                  '__subclasshook__', '__weakref__']
+                  '__subclasshook__', '__weakref__', '__class_getitem__']
 
 # These special attributes will be not collected as protocol members.
 EXCLUDED_ATTRIBUTES = _TYPING_INTERNALS + _SPECIAL_NAMES + ['_MutableMapping__marker']
@@ -1705,9 +1706,7 @@ def _make_nmtuple(name, types):
     msg = "NamedTuple('Name', [(f0, t0), (f1, t1), ...]); each t must be a type"
     types = [(n, _type_check(t, msg)) for n, t in types]
     nm_tpl = collections.namedtuple(name, [n for n, t in types])
-    # Prior to PEP 526, only _field_types attribute was assigned.
-    # Now __annotations__ are used and _field_types is deprecated (remove in 3.9)
-    nm_tpl.__annotations__ = nm_tpl._field_types = dict(types)
+    nm_tpl.__annotations__ = dict(types)
     try:
         nm_tpl.__module__ = sys._getframe(2).f_globals.get('__name__', '__main__')
     except (AttributeError, ValueError):
@@ -1716,11 +1715,11 @@ def _make_nmtuple(name, types):
 
 
 # attributes prohibited to set in NamedTuple class syntax
-_prohibited = ('__new__', '__init__', '__slots__', '__getnewargs__',
-               '_fields', '_field_defaults', '_field_types',
-               '_make', '_replace', '_asdict', '_source')
+_prohibited = {'__new__', '__init__', '__slots__', '__getnewargs__',
+               '_fields', '_field_defaults',
+               '_make', '_replace', '_asdict', '_source'}
 
-_special = ('__module__', '__name__', '__annotations__')
+_special = {'__module__', '__name__', '__annotations__'}
 
 
 class NamedTupleMeta(type):
@@ -1728,6 +1727,9 @@ class NamedTupleMeta(type):
     def __new__(cls, typename, bases, ns):
         if ns.get('_root', False):
             return super().__new__(cls, typename, bases, ns)
+        if len(bases) > 1:
+            raise TypeError("Multiple inheritance with NamedTuple is not supported")
+        assert bases[0] is NamedTuple
         types = ns.get('__annotations__', {})
         nm_tpl = _make_nmtuple(typename, types.items())
         defaults = []
