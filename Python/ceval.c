@@ -10,6 +10,7 @@
 #define PY_LOCAL_AGGRESSIVE
 
 #include "Python.h"
+#include "pycore_abstract.h"   // _PyIndex_Check()
 #include "pycore_call.h"
 #include "pycore_ceval.h"
 #include "pycore_code.h"
@@ -274,54 +275,52 @@ PyEval_ThreadsInitialized(void)
 }
 
 PyStatus
-_PyEval_InitThreads(PyThreadState *tstate)
+_PyEval_InitGIL(PyThreadState *tstate)
 {
-    assert(is_tstate_valid(tstate));
-
-    if (_Py_IsMainInterpreter(tstate)) {
-        struct _gil_runtime_state *gil = &tstate->interp->runtime->ceval.gil;
-        if (gil_created(gil)) {
-            return _PyStatus_OK();
-        }
-
-        PyThread_init_thread();
-        create_gil(gil);
-
-        take_gil(tstate);
+    if (!_Py_IsMainInterpreter(tstate)) {
+        /* Currently, the GIL is shared by all interpreters,
+           and only the main interpreter is responsible to create
+           and destroy it. */
+        return _PyStatus_OK();
     }
 
-    struct _pending_calls *pending = &tstate->interp->ceval.pending;
-    assert(pending->lock == NULL);
-    pending->lock = PyThread_allocate_lock();
-    if (pending->lock == NULL) {
-        return _PyStatus_NO_MEMORY();
-    }
+    struct _gil_runtime_state *gil = &tstate->interp->runtime->ceval.gil;
+    assert(!gil_created(gil));
 
+    PyThread_init_thread();
+    create_gil(gil);
+
+    take_gil(tstate);
+
+    assert(gil_created(gil));
     return _PyStatus_OK();
+}
+
+void
+_PyEval_FiniGIL(PyThreadState *tstate)
+{
+    if (!_Py_IsMainInterpreter(tstate)) {
+        /* Currently, the GIL is shared by all interpreters,
+           and only the main interpreter is responsible to create
+           and destroy it. */
+        return;
+    }
+
+    struct _gil_runtime_state *gil = &tstate->interp->runtime->ceval.gil;
+    if (!gil_created(gil)) {
+        /* First Py_InitializeFromConfig() call: the GIL doesn't exist
+           yet: do nothing. */
+        return;
+    }
+
+    destroy_gil(gil);
+    assert(!gil_created(gil));
 }
 
 void
 PyEval_InitThreads(void)
 {
     /* Do nothing: kept for backward compatibility */
-}
-
-void
-_PyEval_FiniThreads(PyThreadState *tstate)
-{
-    struct _gil_runtime_state *gil = &tstate->interp->runtime->ceval.gil;
-    if (!gil_created(gil)) {
-        return;
-    }
-
-    destroy_gil(gil);
-    assert(!gil_created(gil));
-
-    struct _pending_calls *pending = &tstate->interp->ceval.pending;
-    if (pending->lock != NULL) {
-        PyThread_free_lock(pending->lock);
-        pending->lock = NULL;
-    }
 }
 
 void
@@ -543,6 +542,10 @@ _PyEval_AddPendingCall(PyThreadState *tstate,
 {
     struct _pending_calls *pending = &tstate->interp->ceval.pending;
 
+    /* Ensure that _PyEval_InitPendingCalls() was called
+       and that _PyEval_FiniPendingCalls() is not called yet. */
+    assert(pending->lock != NULL);
+
     PyThread_acquire_lock(pending->lock, WAIT_LOCK);
     if (pending->finishing) {
         PyThread_release_lock(pending->lock);
@@ -720,10 +723,27 @@ _PyEval_InitRuntimeState(struct _ceval_runtime_state *ceval)
     _gil_initialize(&ceval->gil);
 }
 
-void
+int
 _PyEval_InitState(struct _ceval_state *ceval)
 {
-    /* PyInterpreterState_New() initializes ceval to zero */
+    struct _pending_calls *pending = &ceval->pending;
+    assert(pending->lock == NULL);
+
+    pending->lock = PyThread_allocate_lock();
+    if (pending->lock == NULL) {
+        return -1;
+    }
+    return 0;
+}
+
+void
+_PyEval_FiniState(struct _ceval_state *ceval)
+{
+    struct _pending_calls *pending = &ceval->pending;
+    if (pending->lock != NULL) {
+        PyThread_free_lock(pending->lock);
+        pending->lock = NULL;
+    }
 }
 
 int
@@ -5089,7 +5109,7 @@ _PyEval_SliceIndex(PyObject *v, Py_ssize_t *pi)
     PyThreadState *tstate = _PyThreadState_GET();
     if (v != Py_None) {
         Py_ssize_t x;
-        if (PyIndex_Check(v)) {
+        if (_PyIndex_Check(v)) {
             x = PyNumber_AsSsize_t(v, NULL);
             if (x == -1 && _PyErr_Occurred(tstate))
                 return 0;
@@ -5110,7 +5130,7 @@ _PyEval_SliceIndexNotNone(PyObject *v, Py_ssize_t *pi)
 {
     PyThreadState *tstate = _PyThreadState_GET();
     Py_ssize_t x;
-    if (PyIndex_Check(v)) {
+    if (_PyIndex_Check(v)) {
         x = PyNumber_AsSsize_t(v, NULL);
         if (x == -1 && _PyErr_Occurred(tstate))
             return 0;
