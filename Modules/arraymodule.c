@@ -552,9 +552,6 @@ DEFINE_COMPAREITEMS(QQ, unsigned long long)
  *
  * Don't forget to update typecode_to_mformat_code() if you add a new
  * typecode.
- *
- * Note impl depends on all .itemsize being a power of 2 where memoryview
- * initialization checks pointer alignment
  */
 static const struct arraydescr descriptors[] = {
     {'b', 1, b_getitem, b_setitem, b_compareitems, "b", 1, 1},
@@ -629,7 +626,8 @@ wrap_to_array(PyTypeObject *type, Py_buffer *view,
     if (op != NULL) {
         op->ob_item = view->buf;
         op->ob_descr = descr;
-        Py_SIZE(op) = (op->allocated = view->len / descr->itemsize);
+        op->allocated = view->len / descr->itemsize;
+        Py_SIZE(op) = op->allocated;
         op->weakreflist = NULL;
         op->view = view;
         op->ob_exports = 0;
@@ -2648,13 +2646,11 @@ get_compatible_view(int typecode, PyObject *initial,
     if (-1 == gb_result) {
         badness = 1;
     } else if (0 != view->len) { /* on non-empty array, check len, base vs element size */
-        long long align_mask = (descr->itemsize - 1);
-
-        if (((long long)(view->buf) & align_mask) != 0) {
+        if (((long long)(view->buf) % descr->itemsize) != 0) {
             PyErr_SetString(PyExc_ValueError,
                             "buffer base pointer must be aligned to element size" );
             badness = 1;
-        } else if ((view->len & align_mask) != 0) {
+        } else if ((view->len % descr->itemsize) != 0) {
             PyErr_SetString(PyExc_ValueError,
                             "element size must evenly divide buffer size" );
             badness = 1;
@@ -2713,7 +2709,9 @@ array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
     }
 
-    /* Construct from a Memoryview.
+    PyObject *a;
+
+    /* Construct from a MemoryView.
      * Requires a MemoryView instead of using PyObjectCheckBuffer
      * because initialization from bytes-like objects, which
      * can export buffers, is expected to make a copy of
@@ -2725,118 +2723,115 @@ array_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         Py_buffer *view = get_compatible_view(c, initial, descr);
         if (NULL == view) { return NULL; }
 
-        PyObject *rv = wrap_to_array(type, view, descr);
-        if (NULL == rv) {
+        a = wrap_to_array(type, view, descr);
+        if (NULL == a) {
             PyBuffer_Release(view);
             PyMem_Free(view);
-        }
-        return rv;
-    }
-
-    /* Initialization where the array owns its own buffer memory below */
-    if (!(initial == NULL || PyList_Check(initial)
-          || PyByteArray_Check(initial)
-          || PyBytes_Check(initial)
-          || PyTuple_Check(initial)
-          || ((c=='u') && PyUnicode_Check(initial))
-          || (array_Check(initial)
-              && c == ((arrayobject*)initial)->ob_descr->typecode))) {
-        it = PyObject_GetIter(initial);
-        if (it == NULL)
             return NULL;
-        /* We set initial to NULL so that the subsequent code
-           will create an empty array of the appropriate type
-           and afterwards we can use array_iter_extend to populate
-           the array.
-        */
-        initial = NULL;
-    }
+        }
+    } else {
+        /* Initialization where the array owns its own buffer memory below */
+        if (!(initial == NULL || PyList_Check(initial)
+              || PyByteArray_Check(initial)
+              || PyBytes_Check(initial)
+              || PyTuple_Check(initial)
+              || ((c == 'u') && PyUnicode_Check(initial))
+              || (array_Check(initial)
+                  && c == ((arrayobject *) initial)->ob_descr->typecode))) {
+            it = PyObject_GetIter(initial);
+            if (it == NULL)
+                return NULL;
+            /* We set initial to NULL so that the subsequent code
+               will create an empty array of the appropriate type
+               and afterwards we can use array_iter_extend to populate
+               the array.
+            */
+            initial = NULL;
+        }
 
-    PyObject *a;
-    Py_ssize_t len;
+        Py_ssize_t len;
 
-    if (initial == NULL)
-        len = 0;
-    else if (PyList_Check(initial))
-        len = PyList_GET_SIZE(initial);
-    else if (PyTuple_Check(initial) || array_Check(initial))
-        len = Py_SIZE(initial);
-    else
-        len = 0;
+        if (initial == NULL)
+            len = 0;
+        else if (PyList_Check(initial))
+            len = PyList_GET_SIZE(initial);
+        else if (PyTuple_Check(initial) || array_Check(initial))
+            len = Py_SIZE(initial);
+        else
+            len = 0;
 
-    a = newarrayobject(type, len, descr);
-    if (a == NULL)
-        return NULL;
+        a = newarrayobject(type, len, descr);
+        if (a == NULL)
+            return NULL;
 
-    if (len > 0 && !array_Check(initial)) {
-        Py_ssize_t i;
-        for (i = 0; i < len; i++) {
-            PyObject *v =
-                    PySequence_GetItem(initial, i);
+        if (len > 0 && !array_Check(initial)) {
+            Py_ssize_t i;
+            for (i = 0; i < len; i++) {
+                PyObject *v =
+                        PySequence_GetItem(initial, i);
+                if (v == NULL) {
+                    Py_DECREF(a);
+                    return NULL;
+                }
+                if (setarrayitem(a, i, v) != 0) {
+                    Py_DECREF(v);
+                    Py_DECREF(a);
+                    return NULL;
+                }
+                Py_DECREF(v);
+            }
+        } else if (initial != NULL && (PyByteArray_Check(initial) ||
+                                       PyBytes_Check(initial))) {
+            PyObject *v;
+            v = array_array_frombytes((arrayobject *) a,
+                                      initial);
             if (v == NULL) {
                 Py_DECREF(a);
                 return NULL;
             }
-            if (setarrayitem(a, i, v) != 0) {
-                Py_DECREF(v);
-                Py_DECREF(a);
-                return NULL;
-            }
             Py_DECREF(v);
-        }
-    }
-    else if (initial != NULL && (PyByteArray_Check(initial) ||
-                                 PyBytes_Check(initial))) {
-        PyObject *v;
-        v = array_array_frombytes((arrayobject *)a,
-                                  initial);
-        if (v == NULL) {
-            Py_DECREF(a);
-            return NULL;
-        }
-        Py_DECREF(v);
-    }
-    else if (initial != NULL && PyUnicode_Check(initial))  {
-        Py_UNICODE *ustr;
-        Py_ssize_t n;
+        } else if (initial != NULL && PyUnicode_Check(initial)) {
+            Py_UNICODE *ustr;
+            Py_ssize_t n;
 
-        ustr = PyUnicode_AsUnicode(initial);
-        if (ustr == NULL) {
-            PyErr_NoMemory();
-            Py_DECREF(a);
-            return NULL;
-        }
-
-        n = PyUnicode_GET_DATA_SIZE(initial);
-        if (n > 0) {
-            arrayobject *self = (arrayobject *)a;
-            char *item = self->ob_item;
-            item = (char *)PyMem_Realloc(item, n);
-            if (item == NULL) {
+            ustr = PyUnicode_AsUnicode(initial);
+            if (ustr == NULL) {
                 PyErr_NoMemory();
                 Py_DECREF(a);
                 return NULL;
             }
-            self->ob_item = item;
-            Py_SET_SIZE(self, n / sizeof(Py_UNICODE));
-            memcpy(item, ustr, n);
-            self->allocated = Py_SIZE(self);
+
+            n = PyUnicode_GET_DATA_SIZE(initial);
+            if (n > 0) {
+                arrayobject *self = (arrayobject *) a;
+                char *item = self->ob_item;
+                item = (char *) PyMem_Realloc(item, n);
+                if (item == NULL) {
+                    PyErr_NoMemory();
+                    Py_DECREF(a);
+                    return NULL;
+                }
+                self->ob_item = item;
+                Py_SET_SIZE(self, n / sizeof(Py_UNICODE));
+                memcpy(item, ustr, n);
+                self->allocated = Py_SIZE(self);
+            }
+        } else if (initial != NULL && array_Check(initial) && len > 0) {
+            arrayobject *self = (arrayobject *) a;
+            arrayobject *other = (arrayobject *) initial;
+            memcpy(self->ob_item, other->ob_item, len * other->ob_descr->itemsize);
         }
-    }
-    else if (initial != NULL && array_Check(initial) && len > 0) {
-        arrayobject *self = (arrayobject *)a;
-        arrayobject *other = (arrayobject *)initial;
-        memcpy(self->ob_item, other->ob_item, len * other->ob_descr->itemsize);
+
+        if (it != NULL) {
+            if (array_iter_extend((arrayobject *) a, it) == -1) {
+                Py_DECREF(it);
+                Py_DECREF(a);
+                return NULL;
+            }
+            Py_DECREF(it);
+        }
     }
 
-    if (it != NULL) {
-        if (array_iter_extend((arrayobject *)a, it) == -1) {
-            Py_DECREF(it);
-            Py_DECREF(a);
-            return NULL;
-        }
-        Py_DECREF(it);
-    }
     return a;
 }
 
