@@ -32,9 +32,8 @@
 */
 
 #include "Python.h"
-#include "pycore_object.h"
-#include "pycore_pystate.h"
-#include "structmember.h"
+#include "pycore_object.h"        // _PyObject_GC_UNTRACK()
+#include <stddef.h>               // offsetof()
 
 /* Object used as dummy key to fill deleted entries */
 static PyObject _dummy_struct;
@@ -2383,12 +2382,6 @@ PySet_Add(PyObject *anyset, PyObject *key)
         return -1;
     }
     return set_add_key((PySetObject *)anyset, key);
-}
-
-int
-PySet_ClearFreeList(void)
-{
-    return 0;
 }
 
 void
